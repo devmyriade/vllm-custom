@@ -1,0 +1,316 @@
+From 8f482764356df35741ff60dc96f444694400646f Mon Sep 17 00:00:00 2001
+From: dev myriade <dev@myriade.io>
+Date: Sat, 1 Feb 2025 16:41:16 +0000
+Subject: [PATCH] powv wip
+
+---
+ vllm/engine/llm_engine.py                     |  1 +
+ vllm/entrypoints/openai/api_server.py         |  2 +-
+ vllm/entrypoints/openai/protocol.py           |  4 ++
+ vllm/entrypoints/openai/serving_chat.py       |  5 ++
+ vllm/entrypoints/openai/serving_completion.py |  2 +
+ vllm/model_executor/layers/sampler.py         |  1 +
+ vllm/outputs.py                               | 14 ++++--
+ vllm/sequence.py                              |  3 ++
+ vllm/worker/model_runner.py                   | 50 ++++++++++++++++++-
+ 9 files changed, 76 insertions(+), 6 deletions(-)
+
+diff --git a/vllm/engine/llm_engine.py b/vllm/engine/llm_engine.py
+index dd677300..9ddeb1a9 100644
+--- a/vllm/engine/llm_engine.py
++++ b/vllm/engine/llm_engine.py
+@@ -1101,6 +1101,7 @@ class LLMEngine:
+                 self._process_sequence_group_outputs(seq_group, output)
+             else:
+                 self.output_processor.process_prompt_logprob(seq_group, output)
++                seq_group.powv = output[0].powv
+                 if seq_group_meta.do_sample:
+                     self.output_processor.process_outputs(
+                         seq_group, output, is_async)
+diff --git a/vllm/entrypoints/openai/api_server.py b/vllm/entrypoints/openai/api_server.py
+index 9e5cf4ba..0838447c 100644
+--- a/vllm/entrypoints/openai/api_server.py
++++ b/vllm/entrypoints/openai/api_server.py
+@@ -83,7 +83,7 @@ from vllm.utils import (FlexibleArgumentParser, get_open_zmq_ipc_path,
+ from vllm.version import __version__ as VLLM_VERSION
+ 
+ TIMEOUT_KEEP_ALIVE = 5  # seconds
+-
++POWV_VERIFY_VERSION = "2"
+ prometheus_multiproc_dir: tempfile.TemporaryDirectory
+ 
+ # Cannot use __name__ (https://github.com/vllm-project/vllm/pull/4765)
+diff --git a/vllm/entrypoints/openai/protocol.py b/vllm/entrypoints/openai/protocol.py
+index 29d071ce..f6bcbfd7 100644
+--- a/vllm/entrypoints/openai/protocol.py
++++ b/vllm/entrypoints/openai/protocol.py
+@@ -1085,6 +1085,8 @@ class CompletionResponseChoice(OpenAIBaseModel):
+             "to stop, None if the completion finished for some other reason "
+             "including encountering the EOS token"),
+     )
++    powv: Optional[int] = None
++    token_ids: Optional[List[int]] = None
+     prompt_logprobs: Optional[List[Optional[Dict[int, Logprob]]]] = None
+ 
+ 
+@@ -1109,6 +1111,8 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
+             "to stop, None if the completion finished for some other reason "
+             "including encountering the EOS token"),
+     )
++    powv: Optional[int] = None
++    token_ids: Optional[List[int]] = None
+ 
+ 
+ class CompletionStreamResponse(OpenAIBaseModel):
+diff --git a/vllm/entrypoints/openai/serving_chat.py b/vllm/entrypoints/openai/serving_chat.py
+index dc97f0eb..0d63c565 100644
+--- a/vllm/entrypoints/openai/serving_chat.py
++++ b/vllm/entrypoints/openai/serving_chat.py
+@@ -379,6 +379,7 @@ class OpenAIServingChat(OpenAIServing):
+                                 content="",
+                             ),
+                             logprobs=None,
++                            token_ids=res.prompt_token_ids,
+                             finish_reason=None)
+                         chunk = ChatCompletionStreamResponse(
+                             id=request_id,
+@@ -412,6 +413,8 @@ class OpenAIServingChat(OpenAIServing):
+                                         index=i,
+                                         delta=DeltaMessage(
+                                             content=last_msg_content),
++                                        token_ids=output.token_ids,
++                                        powv=output.powv,
+                                         logprobs=None,
+                                         finish_reason=None))
+                                 chunk = ChatCompletionStreamResponse(
+@@ -539,6 +542,8 @@ class OpenAIServingChat(OpenAIServing):
+                         choice_data = ChatCompletionResponseStreamChoice(
+                             index=i,
+                             delta=delta_message,
++                            token_ids=output.token_ids,
++                            powv=output.powv,
+                             logprobs=logprobs,
+                             finish_reason=None)
+ 
+diff --git a/vllm/entrypoints/openai/serving_completion.py b/vllm/entrypoints/openai/serving_completion.py
+index 13c39263..d6f48aaf 100644
+--- a/vllm/entrypoints/openai/serving_completion.py
++++ b/vllm/entrypoints/openai/serving_completion.py
+@@ -335,6 +335,8 @@ class OpenAIServingCompletion(OpenAIServing):
+                                 logprobs=logprobs,
+                                 finish_reason=finish_reason,
+                                 stop_reason=stop_reason,
++                                token_ids=delta_token_ids,
++                                powv=output.powv,
+                             )
+                         ])
+                     if include_continuous_usage:
+diff --git a/vllm/model_executor/layers/sampler.py b/vllm/model_executor/layers/sampler.py
+index 8dc26309..cf0e17f0 100644
+--- a/vllm/model_executor/layers/sampler.py
++++ b/vllm/model_executor/layers/sampler.py
+@@ -126,6 +126,7 @@ class SamplerOutput(
+     # Time taken in the model execute function. This will include model forward,
+     # block/sync across workers, cpu-gpu sync time and sampling time.
+     model_execute_time: Optional[float] = None
++    powv: Optional[int] = None
+ 
+     def __getitem__(self, idx: int) -> CompletionSequenceGroupOutput:
+         return self.outputs[idx]
+diff --git a/vllm/outputs.py b/vllm/outputs.py
+index 25b22652..ff09c10c 100644
+--- a/vllm/outputs.py
++++ b/vllm/outputs.py
+@@ -1,6 +1,6 @@
+ import time
+ from dataclasses import dataclass
+-from typing import Dict, Generic, List, MutableSequence, Optional
++from typing import Dict, Generic, List, MutableSequence, Optional, Tuple
+ from typing import Sequence as GenericSequence
+ from typing import Union
+ 
+@@ -41,6 +41,7 @@ class CompletionOutput:
+     finish_reason: Optional[str] = None
+     stop_reason: Union[int, str, None] = None
+     lora_request: Optional[LoRARequest] = None
++    powv: Optional[int] = None
+ 
+     def finished(self) -> bool:
+         return self.finish_reason is not None
+@@ -116,6 +117,7 @@ class RequestOutput:
+         encoder_prompt: Optional[str] = None,
+         encoder_prompt_token_ids: Optional[List[int]] = None,
+         num_cached_tokens: Optional[int] = None,
++        powv: Optional[int] = None,
+         *,
+         multi_modal_placeholders: Optional[MultiModalPlaceholderDict] = None,
+     ) -> None:
+@@ -131,6 +133,7 @@ class RequestOutput:
+         self.encoder_prompt = encoder_prompt
+         self.encoder_prompt_token_ids = encoder_prompt_token_ids
+         self.num_cached_tokens = num_cached_tokens
++        self.powv: Optional[int] = powv
+ 
+     @classmethod
+     def new(
+@@ -283,6 +286,7 @@ class RequestOutput:
+                 output.finish_reason = SequenceStatus.get_finished_reason(
+                     seq.status)
+                 output.stop_reason = seq.stop_reason
++                output.powv = seq_group.powv
+ 
+             else:
+                 output = CompletionOutput(
+@@ -291,7 +295,7 @@ class RequestOutput:
+                     seq.get_cumulative_logprob() if include_logprobs else None,
+                     output_logprobs,
+                     SequenceStatus.get_finished_reason(seq.status),
+-                    seq.stop_reason)
++                    seq.stop_reason, powv=seq_group.powv)
+ 
+             outputs.append(output)
+ 
+@@ -364,11 +368,12 @@ class PoolingRequestOutput(Generic[_O]):
+     """
+ 
+     def __init__(self, request_id: str, outputs: _O,
+-                 prompt_token_ids: List[int], finished: bool):
++                 prompt_token_ids: List[int], finished: bool, powv: Optional[int]=None):
+         self.request_id = request_id
+         self.prompt_token_ids = prompt_token_ids
+         self.finished = finished
+         self.outputs = outputs
++        self.powv = powv
+ 
+     @staticmethod
+     def from_seq_group(seq_group: SequenceGroup) -> "PoolingRequestOutput":
+@@ -381,7 +386,7 @@ class PoolingRequestOutput(Generic[_O]):
+         finished = seq_group.is_finished()
+ 
+         return PoolingRequestOutput(seq_group.request_id, output,
+-                                    prompt_token_ids, finished)
++                                    prompt_token_ids, finished, seq_group.powv)
+ 
+     def __repr__(self):
+         """
+@@ -447,6 +452,7 @@ class EmbeddingRequestOutput(PoolingRequestOutput[EmbeddingOutput]):
+             outputs=EmbeddingOutput.from_base(request_output.outputs),
+             prompt_token_ids=request_output.prompt_token_ids,
+             finished=request_output.finished,
++            
+         )
+ 
+ 
+diff --git a/vllm/sequence.py b/vllm/sequence.py
+index 74320db7..23fd86f2 100644
+--- a/vllm/sequence.py
++++ b/vllm/sequence.py
+@@ -653,6 +653,7 @@ class SequenceGroup:
+         trace_headers: Optional[Mapping[str, str]] = None,
+         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+         priority: int = 0,
++        powv: Optional[int]=None
+     ) -> None:
+         self.request_id = request_id
+         self.seqs = seqs
+@@ -660,6 +661,7 @@ class SequenceGroup:
+         self.arrival_time = arrival_time
+         self.is_single_seq = len(seqs) == 1
+         self.seqs_dict = {seq.seq_id: seq for seq in seqs}
++        self.powv = powv
+ 
+         self.sampling_params = sampling_params
+         self.metrics = RequestMetrics(arrival_time=arrival_time,
+@@ -1078,6 +1080,7 @@ class CompletionSequenceGroupOutput(
+     samples: List[SequenceOutput]
+     # Prompt logprob for each prompt query token.
+     prompt_logprobs: Optional[PromptLogprobs]
++    powv: Optional[int]=None
+ 
+     def __repr__(self) -> str:
+         return (f"CompletionSequenceGroupOutput(samples={self.samples}, "
+diff --git a/vllm/worker/model_runner.py b/vllm/worker/model_runner.py
+index 322d91d6..934e18b8 100644
+--- a/vllm/worker/model_runner.py
++++ b/vllm/worker/model_runner.py
+@@ -14,7 +14,7 @@ import torch
+ import torch.distributed
+ import torch.nn as nn
+ from tqdm import tqdm
+-
++from math import floor
+ import vllm.envs as envs
+ from vllm.attention import AttentionMetadata, get_attn_backend
+ from vllm.attention.backends.abstract import AttentionState
+@@ -1083,6 +1083,7 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
+ 
+         # Lazy initialization
+         self.model: nn.Module  # Set after load_model
++        self.model_num_params: int
+         # Set after load_model.
+         self.lora_manager: Optional[LRUCacheWorkerLoRAManager] = None
+         self.prompt_adapter_manager: LRUCacheWorkerPromptAdapterManager = None
+@@ -1162,6 +1163,37 @@ class GPUModelRunnerBase(ModelRunnerBase[TModelInputForGPU]):
+                 fullgraph=envs.VLLM_TEST_DYNAMO_FULLGRAPH_CAPTURE,
+                 backend=backend)
+ 
++
++    def get_powv(
++        self,
++        input_tokens,
++        response_tokens,
++    ) -> int:
++        """
++        Calculates probability of weights value that can be used to verify the outputs
++        of a model were made with the model claimed.
++        """
++        powv = 0
++        input_sum = sum(input_tokens)
++        output_sum = sum(response_tokens)
++        token_sum = input_sum + output_sum
++        param_index = token_sum % self.model_num_params
++        for k, param in enumerate(self.model.parameters()):
++            if k != param_index:
++                continue
++            if param.dim() == 1:
++                weights = param.tolist()
++            else:
++                tensor_index = output_sum % param.size()[0]
++                weights = param[tensor_index].tolist()
++            if len(weights) == 0:
++                param_index += 1
++                continue
++            weight_index = input_sum % len(weights)
++            powv = floor(weights[weight_index] * token_sum)
++            break
++        return powv
++
+     def get_model(self) -> nn.Module:
+         return self.model
+ 
+@@ -1709,6 +1741,22 @@ class ModelRunner(GPUModelRunnerBase[ModelInputForGPUWithSamplingMetadata]):
+             "finished_requests_ids": model_input.finished_requests_ids,
+             "request_ids_to_seq_ids": model_input.request_ids_to_seq_ids,
+         } if self.has_inner_state else {}
++
++
++        if(model_input.input_positions is not None and model_input.sampling_metadata is not None):
++            for i, o in enumerate(output.outputs):
++                seq_id = model_input.sampling_metadata.seq_groups[i].seq_ids[0]
++                input_tokens = (
++                    model_input.sampling_metadata.seq_groups[i]
++                    .seq_data[seq_id]
++                    .get_prompt_token_ids()
++                )
++                output_tokens = (
++                    model_input.sampling_metadata.seq_groups[i]
++                    .seq_data[seq_id]
++                    .get_output_token_ids()
++                )
++                o.powv = self.get_powv(input_tokens, output_tokens)
+         if (self.observability_config is not None
+                 and self.observability_config.collect_model_forward_time):
+             model_forward_start = torch.cuda.Event(enable_timing=True)
+-- 
+2.30.2
+
